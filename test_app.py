@@ -241,6 +241,71 @@ class TestValidateSizesApi(unittest.TestCase):
         self.assertTrue(data['ok'])
         self.assertEqual(data['sizes'][0]['yarn']['balls'], 2)
 
+    def test_yarn_tiny_excess_still_rounds_up_extra_ball(self):
+        # 一行 k：每针 1.0000000001g、每团 1g、损耗 0 -> 用量 1.0000000001g
+        # 严格向上取整应为 2 团（逐行与汇总克重显示仍为 1.00g）
+        sizes = [{'name': 'S', 'cast_on': 1}]
+        yarn = {'k': 1.0000000001, 'p': 0, 'yo': 0, 'k2tog': 0,
+                'waste_percent': 0, 'grams_per_ball': 1}
+        data = self.post(sizes, 'k*1', yarn)
+        self.assertTrue(data['ok'])
+        s = data['sizes'][0]
+        self.assertEqual(s['rows'][0]['weight'], 1.0)
+        self.assertEqual(s['yarn']['raw_total'], 1.0)
+        self.assertEqual(s['yarn']['with_waste'], 1.0)
+        self.assertEqual(s['yarn']['balls'], 2)
+
+    def test_yarn_tiny_excess_from_numeric_string(self):
+        # 高精度小数字符串同样按十进制字面精确处理：1.0001g、每团 1g -> 2 团
+        sizes = [{'name': 'S', 'cast_on': 1}]
+        yarn = {'k': '1.0001', 'p': '0', 'yo': '0', 'k2tog': '0',
+                'waste_percent': '0', 'grams_per_ball': '1'}
+        data = self.post(sizes, 'k*1', yarn)
+        self.assertTrue(data['ok'])
+        s = data['sizes'][0]
+        self.assertEqual(s['yarn']['raw_total'], 1.0)
+        self.assertEqual(s['yarn']['balls'], 2)
+
+    def test_yarn_waste_tiny_excess_rounds_up(self):
+        # 每团 1g、损耗 10%：0.92g ×1.1 = 1.012g -> 2 团
+        sizes = [{'name': 'S', 'cast_on': 1}]
+        yarn = {'k': 0.92, 'p': 0, 'yo': 0, 'k2tog': 0,
+                'waste_percent': 10, 'grams_per_ball': 1}
+        data = self.post(sizes, 'k*1', yarn)
+        self.assertTrue(data['ok'])
+        s = data['sizes'][0]
+        self.assertEqual(s['yarn']['raw_total'], 0.92)
+        self.assertEqual(s['yarn']['with_waste'], 1.01)
+        self.assertEqual(s['yarn']['balls'], 2)
+
+    def test_yarn_accumulation_keeps_full_decimal_precision(self):
+        # 3 行各 1 针、每针 0.1g：累计 0.30g，每团 0.3g 恰好 1 团
+        # （浮点实现会算成 0.30000000000000004 而多算一团）
+        # 起针 1，每行 k 消耗 1 产出 1，三行都平衡
+        sizes = [{'name': 'S', 'cast_on': 1}]
+        yarn = {'k': 0.1, 'p': 0, 'yo': 0, 'k2tog': 0,
+                'waste_percent': 0, 'grams_per_ball': 0.3}
+        data = self.post(sizes, 'k\nk\nk', yarn)
+        self.assertTrue(data['ok'])
+        s = data['sizes'][0]
+        self.assertEqual([r['weight'] for r in s['rows']], [0.1, 0.2, 0.3])
+        self.assertEqual(s['yarn']['raw_total'], 0.3)
+        self.assertEqual(s['yarn']['with_waste'], 0.3)
+        self.assertEqual(s['yarn']['balls'], 1)
+
+    def test_yarn_half_cent_rounds_up_only_in_display(self):
+        # 原始 0.125g 显示为 0.13g（四舍五入两位小数）；但线团数按未舍入值：
+        # 每团 0.125g 恰好 1 团，而非按显示的 0.13g 推算
+        sizes = [{'name': 'S', 'cast_on': 1}]
+        yarn = {'k': '0.125', 'p': '0', 'yo': '0', 'k2tog': '0',
+                'waste_percent': '0', 'grams_per_ball': '0.125'}
+        data = self.post(sizes, 'k*1', yarn)
+        self.assertTrue(data['ok'])
+        s = data['sizes'][0]
+        self.assertEqual(s['rows'][0]['weight'], 0.13)
+        self.assertEqual(s['yarn']['raw_total'], 0.13)
+        self.assertEqual(s['yarn']['balls'], 1)
+
     def test_yarn_count_error_marks_partial_for_that_size(self):
         # 第 2 行 M 差 1 针：M 停止，用量仅含第 1 行且 partial；S/L 完整
         sizes = [{'name': 'S', 'cast_on': 4},

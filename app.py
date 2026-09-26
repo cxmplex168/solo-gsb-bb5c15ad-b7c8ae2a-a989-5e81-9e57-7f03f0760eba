@@ -207,10 +207,11 @@ POST /api/board-layout  定型板排片（水平层排布，枚举分层与 90°
 final 为最后一行有效推算后的针数（全部通过时即最终针数）。
 
 线材用量按每个尺码每行各记号的实际出现次数（嵌套与按尺码重复均计入）
-乘以单记号克重累计；遇针数错误的尺码停止后续行，其用量为部分估算
-（partial=true）；语法错误同样导致全部尺码的用量为部分估算。含损耗
-总量 = 原始总量 ×(1+waste_percent/100)，线团数为其除以每团克重后
-向上取整。
+乘以单记号克重累计，全程十进制精确运算（Decimal，不用浮点）；遇针数错误
+的尺码停止后续行，其用量为部分估算（partial=true）；语法错误同样导致全部
+尺码的用量为部分估算。含损耗总量 = 原始总量 ×(1+waste_percent/100)，
+线团数按未舍入的含损耗用量除以每团克重后严格向上取整（不减任何容差）；
+逐行与汇总克重仅在输出时四舍五入保留两位小数。
 
 倍数修正建议：某行可解析但至少一个尚在推算的尺码针数不符时，针对首个
 这样的行逐一尝试“仅改该行一个现有的 *n 或 *{...} 倍数”（嵌套重复只按
@@ -223,7 +224,7 @@ final 为最后一行有效推算后的针数（全部通过时即最终针数�
 import math
 import os
 import re
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from fractions import Fraction
 
 from flask import Flask, jsonify, render_template, request
@@ -298,20 +299,27 @@ _YARN_FIELDS = {
 _NUMBER_RE = re.compile(r'^[+-]?(\d+(?:\.\d*)?|\.\d+)$')
 
 
-def _parse_nonneg_number(raw, label, positive=False):
-    """解析非负（positive=True 时必须严格为正）数值，接受数字或纯数字字符串。
+def _parse_decimal(raw, label, positive=False):
+    """解析非负（positive=True 时必须严格为正）十进制数，返回 (Decimal, 错误消息)。
 
-    拒绝布尔值、指数记法（如 1e2）与无法解析的内容，返回 (数值, 错误消息)。
+    接受数字或纯数字字符串，拒绝布尔值、指数记法（如 1e2）与无法解析的
+    内容。十进制输入按字面转为 Decimal，线材参数解析、逐行克重累计、损耗
+    与线团数计算全程不使用浮点。
     """
     if isinstance(raw, bool):
         return None, "{}必须为数值".format(label)
-    if isinstance(raw, (int, float)):
-        value = float(raw)
+    if isinstance(raw, int):
+        value = Decimal(raw)
+    elif isinstance(raw, float):
+        if not math.isfinite(raw):
+            return None, "{}必须为数值".format(label)
+        # 先经 str 再转 Decimal，按最短可读的十进制字面取值
+        value = Decimal(str(raw))
     elif isinstance(raw, str) and _NUMBER_RE.match(raw.strip()):
-        value = float(raw.strip())
+        value = Decimal(raw.strip())
     else:
         return None, "{}必须为数值".format(label)
-    if not math.isfinite(value) or value < 0:
+    if not value.is_finite() or value < 0:
         return None, "{}不能为负数".format(label)
     if positive and value <= 0:
         return None, "{}必须大于 0".format(label)
@@ -331,13 +339,13 @@ def _parse_yarn(raw):
     for key in ('k', 'p', 'yo', 'k2tog', 'waste_percent'):
         if key not in raw:
             return None, "缺少{}参数".format(_YARN_FIELDS[key])
-        value, err = _parse_nonneg_number(raw[key], _YARN_FIELDS[key])
+        value, err = _parse_decimal(raw[key], _YARN_FIELDS[key])
         if err:
             return None, err
         yarn[key] = value
     if 'grams_per_ball' not in raw:
         return None, "缺少{}参数".format(_YARN_FIELDS['grams_per_ball'])
-    value, err = _parse_nonneg_number(
+    value, err = _parse_decimal(
         raw['grams_per_ball'], _YARN_FIELDS['grams_per_ball'], positive=True)
     if err:
         return None, err
@@ -422,6 +430,11 @@ def _parse_layout_sizes(raw):
 def _cm(frac):
     """精确分数转厘米显示值（保留两位小数）。"""
     return round(float(frac), 2)
+
+
+def _grams(value):
+    """精确 Decimal 克重转显示值：仅在输出时四舍五入保留两位小数。"""
+    return float(value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
 
 def _parse_stripe_colors(raw):
@@ -650,56 +663,61 @@ def validate_sizes():
         "rows": [],
         "error": None,
         "active": True,
-        "raw_weight": 0.0 if yarn is not None else None,
+        "raw_weight": Decimal(0) if yarn is not None else None,
     } for s in sizes]
 
     first_count_error = None  # (行号, 原文, 各尺码可用针数)：首个针数差额行
-    for lineno, raw_line in enumerate(pattern.splitlines(), 1):
-        if not any(st["active"] for st in states):
-            break  # 所有尺码都已停止，后续行不再推算
-        text = raw_line.strip()
-        if not text:  # 跳过空行，行号仍按原始文本计算
-            continue
-        try:
-            consumes, produces, tallies = parse_row_details(text, num_sizes)
-        except ParseError as exc:
-            # 指令非法时任何尺码都无法继续，全部停止并记录同一错误
-            error = _parse_error_obj(lineno, text, exc)
-            for st in states:
-                if st["active"]:
-                    st["error"] = error
+    # 逐行克重累计全程用十进制精确运算：提高上下文精度避免长链累计被截断，
+    # 逐行与汇总克重仅在输出时保留两位小数。
+    with localcontext() as ctx:
+        ctx.prec = 50
+        for lineno, raw_line in enumerate(pattern.splitlines(), 1):
+            if not any(st["active"] for st in states):
+                break  # 所有尺码都已停止，后续行不再推算
+            text = raw_line.strip()
+            if not text:  # 跳过空行，行号仍按原始文本计算
+                continue
+            try:
+                consumes, produces, tallies = parse_row_details(text, num_sizes)
+            except ParseError as exc:
+                # 指令非法时任何尺码都无法继续，全部停止并记录同一错误
+                error = _parse_error_obj(lineno, text, exc)
+                for st in states:
+                    if st["active"]:
+                        st["error"] = error
+                        st["active"] = False
+                break
+            if first_count_error is None and any(
+                    st["active"] and consumes[i] != st["available"]
+                    for i, st in enumerate(states)):
+                # 记录首个针数差额行的现场，供事后推导倍数修正建议
+                first_count_error = (lineno, text, [
+                    st["available"] if st["active"] else None for st in states])
+            for i, st in enumerate(states):
+                if not st["active"]:
+                    continue
+                consume, produce = consumes[i], produces[i]
+                if consume != st["available"]:
+                    # 仅停止该尺码，其余尺码继续推算
+                    st["error"] = _count_error_obj(lineno, text, st["available"], consume)
                     st["active"] = False
-            break
-        if first_count_error is None and any(
-                st["active"] and consumes[i] != st["available"]
-                for i, st in enumerate(states)):
-            # 记录首个针数差额行的现场，供事后推导倍数修正建议
-            first_count_error = (lineno, text, [
-                st["available"] if st["active"] else None for st in states])
-        for i, st in enumerate(states):
-            if not st["active"]:
-                continue
-            consume, produce = consumes[i], produces[i]
-            if consume != st["available"]:
-                # 仅停止该尺码，其余尺码继续推算
-                st["error"] = _count_error_obj(lineno, text, st["available"], consume)
-                st["active"] = False
-                continue
-            row = {
-                "line": lineno,
-                "instruction": text,
-                "in": st["available"],
-                "consume": consume,
-                "produce": produce,
-                "out": produce,
-            }
-            if yarn is not None:
-                # 按该尺码本行各记号的实际次数累计原始克重（含嵌套/按尺码重复）
-                st["raw_weight"] += sum(
-                    tallies[name][i] * yarn[name] for name in STITCH_NAMES)
-                row["weight"] = round(st["raw_weight"], 2)
-            st["rows"].append(row)
-            st["available"] = produce
+                    continue
+                row = {
+                    "line": lineno,
+                    "instruction": text,
+                    "in": st["available"],
+                    "consume": consume,
+                    "produce": produce,
+                    "out": produce,
+                }
+                if yarn is not None:
+                    # 按该尺码本行各记号的实际次数累计原始克重（含嵌套/按尺码重复）
+                    st["raw_weight"] += sum(
+                        (Decimal(tallies[name][i]) * yarn[name]
+                         for name in STITCH_NAMES), Decimal(0))
+                    row["weight"] = _grams(st["raw_weight"])
+                st["rows"].append(row)
+                st["available"] = produce
 
     suggestion = None
     if first_count_error is not None:
@@ -1564,22 +1582,35 @@ def board_layout():
 
 
 def _yarn_summary(yarn, state):
-    """按尺码累计结果构造线材用量汇总。"""
-    raw_total = round(state["raw_weight"], 2)
-    factor = 1 + yarn["waste_percent"] / 100.0
-    with_waste_exact = state["raw_weight"] * factor
-    with_waste = round(with_waste_exact, 2)
-    # 抵消浮点误差，避免 3.0000000000000004 被向上取整成 4
-    balls = math.ceil(with_waste_exact / yarn["grams_per_ball"] - 1e-9)
+    """按尺码累计结果构造线材用量汇总。
+
+    含损耗总量与线团数均按未舍入的精确十进制用量计算：克重只在输出时保留
+    两位小数；线团数为含损耗用量除以每团克重后严格向上取整，不减去任何
+    容差（恰好整除不多算一团，任何正余数都要多算一团）。
+    """
+    with localcontext() as ctx:
+        ctx.prec = 50
+        raw_exact = state["raw_weight"]
+        # 1 + waste_percent/100：有限十进制数的精确运算
+        factor = Decimal(1) + yarn["waste_percent"] / Decimal(100)
+        with_waste_exact = raw_exact * factor
+        per_ball = yarn["grams_per_ball"]
+        # 严格 ceil(with_waste_exact / per_ball)：把有限十进制量按各自指数
+        # 放大成整数后做整除向上取整，避免除法舍入把微小正余数抹掉。
+        scale = max(-with_waste_exact.as_tuple().exponent,
+                    -per_ball.as_tuple().exponent, 0)
+        num = int(with_waste_exact.scaleb(scale))
+        den = int(per_ball.scaleb(scale))
+        balls = (num + den - 1) // den if num > 0 else 0
     partial = state["error"] is not None
     return {
-        "raw_total": raw_total,
-        "with_waste": with_waste,
-        "balls": max(balls, 0),
+        "raw_total": _grams(raw_exact),
+        "with_waste": _grams(with_waste_exact),
+        "balls": balls,
         "partial": partial,
         "complete": not partial,
-        "waste_percent": yarn["waste_percent"],
-        "grams_per_ball": yarn["grams_per_ball"],
+        "waste_percent": float(yarn["waste_percent"]),
+        "grams_per_ball": float(yarn["grams_per_ball"]),
     }
 
 
