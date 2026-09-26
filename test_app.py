@@ -241,6 +241,45 @@ class TestValidateSizesApi(unittest.TestCase):
         self.assertTrue(data['ok'])
         self.assertEqual(data['sizes'][0]['yarn']['balls'], 2)
 
+    def test_yarn_tiny_overage_rounds_up_without_tolerance(self):
+        # 一行 k、每针 1.0000000001 克、每团 1 克且损耗 0：用量 1.0000000001
+        # 严格超过 1 团，必须向上取整为 2 团（旧实现减去 1e-9 容差误算为 1）
+        sizes = [{'name': 'S', 'cast_on': 1}]
+        yarn = {'k': 1.0000000001, 'p': 0, 'yo': 0, 'k2tog': 0,
+                'waste_percent': 0, 'grams_per_ball': 1}
+        data = self.post(sizes, 'k', yarn)
+        self.assertTrue(data['ok'])
+        y = data['sizes'][0]['yarn']
+        self.assertEqual(y['raw_total'], 1.0)           # 展示值两位小数
+        self.assertEqual(y['with_waste'], 1.0)
+        self.assertEqual(y['balls'], 2)                 # 线团数按未舍入值取整
+
+    def test_yarn_tiny_overage_from_waste_rounds_up(self):
+        # 原始恰好 1.0g、损耗 0.00000001% -> 含损耗 1.0000000001g，每团 1g
+        sizes = [{'name': 'S', 'cast_on': 1}]
+        yarn = {'k': 1.0, 'p': 0, 'yo': 0, 'k2tog': 0,
+                'waste_percent': 0.00000001, 'grams_per_ball': 1}
+        data = self.post(sizes, 'k', yarn)
+        self.assertTrue(data['ok'])
+        y = data['sizes'][0]['yarn']
+        self.assertEqual(y['with_waste'], 1.0)
+        self.assertEqual(y['balls'], 2)
+
+    def test_yarn_float_drift_across_rows_still_exact(self):
+        # 旧浮点累计下 100 个 0.1 会漂移成 9.999...；十进制精确运算下逐行
+        # weight 为整数克，总量恰为 10g，0% 损耗、每团 1g 时正好 10 团
+        sizes = [{'name': 'S', 'cast_on': 10}]
+        yarn = {'k': 0.1, 'p': 0, 'yo': 0, 'k2tog': 0,
+                'waste_percent': 0, 'grams_per_ball': 1}
+        data = self.post(sizes, '\n'.join(['k*10'] * 10), yarn)
+        self.assertTrue(data['ok'])
+        s = data['sizes'][0]
+        self.assertEqual([r['weight'] for r in s['rows']],
+                         [float(n) for n in range(1, 11)])
+        self.assertEqual(s['yarn']['raw_total'], 10.0)
+        self.assertEqual(s['yarn']['with_waste'], 10.0)
+        self.assertEqual(s['yarn']['balls'], 10)
+
     def test_yarn_count_error_marks_partial_for_that_size(self):
         # 第 2 行 M 差 1 针：M 停止，用量仅含第 1 行且 partial；S/L 完整
         sizes = [{'name': 'S', 'cast_on': 4},

@@ -207,10 +207,12 @@ POST /api/board-layout  定型板排片（水平层排布，枚举分层与 90°
 final 为最后一行有效推算后的针数（全部通过时即最终针数）。
 
 线材用量按每个尺码每行各记号的实际出现次数（嵌套与按尺码重复均计入）
-乘以单记号克重累计；遇针数错误的尺码停止后续行，其用量为部分估算
-（partial=true）；语法错误同样导致全部尺码的用量为部分估算。含损耗
-总量 = 原始总量 ×(1+waste_percent/100)，线团数为其除以每团克重后
-向上取整。
+乘以单记号克重累计；线材参数解析、逐行克重累计与含损耗计算全程用 Decimal
+十进制精确运算，线团数按未舍入的含损耗用量严格向上取整（不减容差），
+逐行与汇总克重仅在输出时保留两位小数。遇针数错误的尺码停止后续行，其用量
+为部分估算（partial=true）；语法错误同样导致全部尺码的用量为部分估算。
+含损耗总量 = 原始总量 ×(1+waste_percent/100)，线团数为其除以每团克重后
+严格向上取整。
 
 倍数修正建议：某行可解析但至少一个尚在推算的尺码针数不符时，针对首个
 这样的行逐一尝试“仅改该行一个现有的 *n 或 *{...} 倍数”（嵌套重复只按
@@ -223,7 +225,7 @@ final 为最后一行有效推算后的针数（全部通过时即最终针数�
 import math
 import os
 import re
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_EVEN, localcontext
 from fractions import Fraction
 
 from flask import Flask, jsonify, render_template, request
@@ -298,20 +300,26 @@ _YARN_FIELDS = {
 _NUMBER_RE = re.compile(r'^[+-]?(\d+(?:\.\d*)?|\.\d+)$')
 
 
-def _parse_nonneg_number(raw, label, positive=False):
-    """解析非负（positive=True 时必须严格为正）数值，接受数字或纯数字字符串。
+def _parse_nonneg_decimal(raw, label, positive=False):
+    """解析非负（positive=True 时必须严格为正）数值为精确 Decimal。
 
-    拒绝布尔值、指数记法（如 1e2）与无法解析的内容，返回 (数值, 错误消息)。
+    接受数字或纯数字字符串，拒绝布尔值、指数记法（如 1e2）与无法解析的
+    内容。浮点输入按其最短十进制表示（str(raw)）解析，故 1.0000000001 保持
+    字面字值；后续克重累计、损耗与线团数全程十进制精确运算，不用浮点。
     """
     if isinstance(raw, bool):
         return None, "{}必须为数值".format(label)
-    if isinstance(raw, (int, float)):
-        value = float(raw)
+    if isinstance(raw, int):
+        value = Decimal(raw)
+    elif isinstance(raw, float):
+        if not math.isfinite(raw):
+            return None, "{}必须为数值".format(label)
+        value = Decimal(str(raw))
     elif isinstance(raw, str) and _NUMBER_RE.match(raw.strip()):
-        value = float(raw.strip())
+        value = Decimal(raw.strip())
     else:
         return None, "{}必须为数值".format(label)
-    if not math.isfinite(value) or value < 0:
+    if value < 0:
         return None, "{}不能为负数".format(label)
     if positive and value <= 0:
         return None, "{}必须大于 0".format(label)
@@ -321,7 +329,8 @@ def _parse_nonneg_number(raw, label, positive=False):
 def _parse_yarn(raw):
     """校验线材用量参数，返回 (dict 或 None, 错误消息)。
 
-    缺省（不传 yarn）时返回 (None, None)，表示不做用量估算。
+    缺省（不传 yarn）时返回 (None, None)，表示不做用量估算。各参数解析为
+    精确 Decimal，克重累计与线团数计算全程不用浮点。
     """
     if raw is None:
         return None, None
@@ -331,13 +340,13 @@ def _parse_yarn(raw):
     for key in ('k', 'p', 'yo', 'k2tog', 'waste_percent'):
         if key not in raw:
             return None, "缺少{}参数".format(_YARN_FIELDS[key])
-        value, err = _parse_nonneg_number(raw[key], _YARN_FIELDS[key])
+        value, err = _parse_nonneg_decimal(raw[key], _YARN_FIELDS[key])
         if err:
             return None, err
         yarn[key] = value
     if 'grams_per_ball' not in raw:
         return None, "缺少{}参数".format(_YARN_FIELDS['grams_per_ball'])
-    value, err = _parse_nonneg_number(
+    value, err = _parse_nonneg_decimal(
         raw['grams_per_ball'], _YARN_FIELDS['grams_per_ball'], positive=True)
     if err:
         return None, err
@@ -650,7 +659,7 @@ def validate_sizes():
         "rows": [],
         "error": None,
         "active": True,
-        "raw_weight": 0.0 if yarn is not None else None,
+        "raw_weight": Decimal(0) if yarn is not None else None,
     } for s in sizes]
 
     first_count_error = None  # (行号, 原文, 各尺码可用针数)：首个针数差额行
@@ -694,10 +703,19 @@ def validate_sizes():
                 "out": produce,
             }
             if yarn is not None:
-                # 按该尺码本行各记号的实际次数累计原始克重（含嵌套/按尺码重复）
-                st["raw_weight"] += sum(
-                    tallies[name][i] * yarn[name] for name in STITCH_NAMES)
-                row["weight"] = round(st["raw_weight"], 2)
+                # 按该尺码本行各记号的实际次数累计原始克重（含嵌套/按尺码重复）；
+                # 记号次数为整数、单记号克重为精确 Decimal，乘法与累计都按实际
+                # 位数抬高精度，全程无浮点误差、无舍入
+                row_weight = Decimal(0)
+                for name in STITCH_NAMES:
+                    row_weight = _exact_decimal(
+                        row_weight,
+                        _exact_decimal(Decimal(tallies[name][i]), yarn[name],
+                                       op=lambda a, b: a * b),
+                        op=lambda a, b: a + b)
+                st["raw_weight"] = _exact_decimal(
+                    st["raw_weight"], row_weight, op=lambda a, b: a + b)
+                row["weight"] = _decimal_out(st["raw_weight"])
             st["rows"].append(row)
             st["available"] = produce
 
@@ -1563,23 +1581,66 @@ def board_layout():
     })
 
 
+def _exact_decimal(*values, op):
+    """对若干 Decimal 做精确加法或乘法，不受默认 28 位精度限制。
+
+    乘法精确结果的有效位数不超过各操作数有效位数之和（加法更少），据此
+    并额外留出入位/进位余量抬高本地区域精度，即可保证不发生舍入；返回
+    精确 Decimal。
+    """
+    if len(values) == 1:
+        return values[0]
+    precision = max(28, sum(len(v.as_tuple().digits) for v in values) + 4)
+    with localcontext() as ctx:
+        ctx.prec = precision
+        result = values[0]
+        for value in values[1:]:
+            result = op(result, value)
+        return result
+
+
+def _decimal_out(value):
+    """精确十进制值转 JSON 数值：输出时四舍五入保留两位小数。
+
+    内部累计与线团数计算始终用未舍入的精确 Decimal；只有逐行/汇总展示值
+    在此处按十进制半偶舍入到两位小数，再转 float（整数则转 int）。
+    """
+    rounded = value.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)
+    return float(rounded)
+
+
+def _decimal_ceil_div(numerator, denominator):
+    """两个非负 Decimal 的商严格向上取整，全程整数精确运算。
+
+    经 Fraction 取得未舍入的精确比值（分子/分母），再用
+    ceil(a/b) = (a + b − 1) // b 取整；不做任何浮点运算、不减容差，
+    因此 1.0000000001 ÷ 1 严格得 2。
+    """
+    ratio = Fraction(numerator) / Fraction(denominator)
+    return (ratio.numerator + ratio.denominator - 1) // ratio.denominator
+
+
 def _yarn_summary(yarn, state):
-    """按尺码累计结果构造线材用量汇总。"""
-    raw_total = round(state["raw_weight"], 2)
-    factor = 1 + yarn["waste_percent"] / 100.0
-    with_waste_exact = state["raw_weight"] * factor
-    with_waste = round(with_waste_exact, 2)
-    # 抵消浮点误差，避免 3.0000000000000004 被向上取整成 4
-    balls = math.ceil(with_waste_exact / yarn["grams_per_ball"] - 1e-9)
+    """按尺码累计结果构造线材用量汇总（十进制精确运算）。"""
+    raw_weight = state["raw_weight"]
+    # 含损耗总量 = 原始总量 ×(1 + 损耗/100) = 原始 ×(100+损耗) / 100：
+    # 乘法按实际位数抬高精度、不发生舍入；除以 100 用 scaleb 做十进制小数点
+    # 平移，结果保持精确。
+    multiplied = _exact_decimal(
+        raw_weight, Decimal(100) + yarn["waste_percent"],
+        op=lambda a, b: a * b)
+    with_waste_exact = multiplied.scaleb(-2)
+    # 线团数按未舍入的含损耗用量严格向上取整，不减任何容差
+    balls = _decimal_ceil_div(with_waste_exact, yarn["grams_per_ball"])
     partial = state["error"] is not None
     return {
-        "raw_total": raw_total,
-        "with_waste": with_waste,
+        "raw_total": _decimal_out(raw_weight),
+        "with_waste": _decimal_out(with_waste_exact),
         "balls": max(balls, 0),
         "partial": partial,
         "complete": not partial,
-        "waste_percent": yarn["waste_percent"],
-        "grams_per_ball": yarn["grams_per_ball"],
+        "waste_percent": _decimal_out(yarn["waste_percent"]),
+        "grams_per_ball": _decimal_out(yarn["grams_per_ball"]),
     }
 
 
